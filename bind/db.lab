@@ -1,0 +1,18 @@
+$TTL 604800
+$ORIGIN lab.
+@   IN  SOA dns.lab. root.lab. (
+        2         ; serial
+        604800    ; refresh
+        86400     ; retry
+        2419200   ; expire
+        604800 )  ; negative cache
+@       IN  NS      dns.lab.
+
+dns.lab.    IN  A       198.18.0.11
+web.lab.    IN  A       198.18.0.12
+ftp.lab.    IN  A       198.18.0.13
+nfs.lab.    IN  A       198.18.0.14
+dns         IN  A       198.18.0.11
+web         IN  A       198.18.0.12
+ftp         IN  A       198.18.0.13
+nfs         IN  A       198.18.0.14

@@ -1,0 +1,1 @@
+/exports 198.18.0.0/24(rw,sync,no_subtree_check,no_root_squash,insecure,fsid=0)

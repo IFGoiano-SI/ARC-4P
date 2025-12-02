@@ -1,0 +1,207 @@
+
+services:
+  router:
+    image: ubuntu:22.04
+    container_name: router-gateway
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    networks:
+      internal_net:
+        ipv4_address: 198.18.0.254
+      bridge_net: {}
+    command:
+      - /bin/bash
+      - -eux
+      - -c
+      - |
+        apt update
+        DEBIAN_FRONTEND=noninteractive apt install -y iptables iproute2
+        # NAT e encaminhamento cru (eth0=WAN bridge_net, eth1=LAN internal_net)
+        iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+        iptables -A FORWARD -i eth0 -o eth1 -m state --state RELATED,ESTABLISHED -j ACCEPT
+        iptables -A FORWARD -i eth1 -o eth0 -j ACCEPT
+        sleep infinity
+
+  dhcp:
+    image: ubuntu:22.04
+    container_name: dhcp-server
+    cap_add:
+      - NET_ADMIN
+    networks:
+      internal_net:
+        ipv4_address: 198.18.0.10
+    volumes:
+      - ./dhcp/dhcp.conf:/etc/dhcp/dhcpd.conf:ro
+      - ./dhcp/dhcpd.leases:/var/lib/dhcp/dhcpd.leases
+    restart: unless-stopped
+    command:
+      - /bin/bash
+      - -eux
+      - -c
+      - |
+        apt update
+        DEBIAN_FRONTEND=noninteractive apt install -y -o Dpkg::Options::="--force-confold" isc-dhcp-server
+        touch /var/lib/dhcp/dhcpd.leases
+        /usr/sbin/dhcpd -f -cf /etc/dhcp/dhcpd.conf eth0
+
+  dns:
+    image: ubuntu:22.04
+    container_name: dns-server
+    networks:
+      internal_net:
+        ipv4_address: 198.18.0.11
+    volumes:
+      - ./bind/named.conf.local:/etc/bind/named.conf.local:ro
+      - ./bind/db.lab:/etc/bind/db.lab:ro
+      - ./bind/named.conf.options:/etc/bind/named.conf.options:ro
+    environment:
+      - TZ=UTC
+    command:
+      - /bin/bash
+      - -eux
+      - -c
+      - |
+        apt update
+        DEBIAN_FRONTEND=noninteractive apt install -y -o Dpkg::Options::="--force-confold" bind9 bind9utils dnsutils
+        named-checkconf /etc/bind/named.conf || true
+        named-checkzone lab /etc/bind/db.lab || true
+        /usr/sbin/named -u bind -g
+
+  web:
+    image: ubuntu:22.04
+    container_name: web-server
+    networks:
+      internal_net:
+        ipv4_address: 198.18.0.12
+      bridge_net: {}
+    ports:
+      - "9157:80"
+    command:
+      - /bin/bash
+      - -eux
+      - -c
+      - |
+        apt update
+        DEBIAN_FRONTEND=noninteractive apt install -y apache2 curl
+        a2enmod rewrite
+        apache2ctl -D FOREGROUND
+
+  ftp:
+    image: stilliard/pure-ftpd:latest
+    container_name: ftp-server
+    restart: unless-stopped
+    networks:
+      internal_net:
+        ipv4_address: 198.18.0.13
+
+    ports:
+      - "21:21"
+      - "30000-30059:30000-30059"
+
+    volumes:
+      - ./ftp_data:/home/ftpusers/ifgoiano
+      - ./pureftpd-passwd:/etc/pure-ftpd/passwd
+
+    environment:
+      PUBLICHOST: "198.18.0.13"
+      FTP_USER_NAME: ifgoiano
+      FTP_USER_PASS: 123
+      FTP_USER_HOME: /home/ftpusers/ifgoiano
+      ADDED_FLAGS: "--nochmod"
+
+    command: [
+      "/run.sh",
+      "-c",
+      "50",
+      "-C",
+      "50",
+      "-l",
+      "puredb:/etc/pure-ftpd/pureftpd.pdb",
+      "-E",
+      "-j",
+      "-R",
+      "-P",
+      "198.18.0.13",
+      "-p",
+      "30000:30059"
+    ]
+
+  nfs:
+    image: ubuntu:22.04
+    container_name: nfs-server
+    networks:
+      internal_net:
+        ipv4_address: 198.18.0.14
+    privileged: true
+    ports:
+      - "2049:2049"
+    volumes:
+      - ./exports:/etc/exports:ro
+      - nfs_exports:/exports:rw
+      - ./nfs_data:/seed:ro
+    restart: unless-stopped
+    command:
+      - /bin/bash
+      - -eux
+      - -c
+      - |
+        apt update
+        DEBIAN_FRONTEND=noninteractive apt install -y nfs-kernel-server rpcbind nfs-common
+        mkdir -p /exports
+        chmod 777 /exports
+        # popular dados iniciais se vazio
+        if [ -d /seed ] && [ -z "$(ls -A /exports)" ]; then cp -a /seed/. /exports/; fi
+        # montar nfsd e iniciar serviços
+        mount -t nfsd nfsd /proc/fs/nfsd || true
+        rpcbind
+        rpc.idmapd || true
+        rpc.nfsd 8
+        exportfs -ra
+        rpc.mountd --no-nfs-version 2 --no-nfs-version 3
+        exportfs -v
+        tail -f /dev/null
+
+  cliente:
+    image: ubuntu:22.04
+    container_name: cliente
+    privileged: true
+    cap_add: [NET_ADMIN, SYS_ADMIN]
+    depends_on:
+      - router
+      - dhcp
+      - dns
+      - web
+      - ftp
+      - nfs
+    networks:
+      internal_net:
+    volumes:
+      - ./mount_nfs.sh:/root/mount_nfs.sh:ro
+      - ./login_ftp.sh:/root/login_ftp.sh:ro
+    command: >
+      bash -c "
+        apt update &&
+        DEBIAN_FRONTEND=noninteractive apt install -y iputils-ping curl dnsutils nfs-common rpcbind net-tools lftp isc-dhcp-client traceroute &&
+        # limpar IP atribuído pelo Docker e solicitar IP via DHCP
+        ip addr flush dev eth0 || true &&
+        dhclient -v -1 eth0 || true &&
+        rpcbind && (command -v rpc.statd >/dev/null 2>&1 && rpc.statd || true) &&
+        mkdir -p /mnt/nfs &&
+        echo 'Cliente pronto.' &&
+        tail -f /dev/null
+      "
+
+networks:
+  internal_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 198.18.0.0/24
+  bridge_net:
+    driver: bridge
+
+volumes:
+  nfs_exports:
